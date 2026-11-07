@@ -148,6 +148,9 @@ node --check client.js
 npm pack --dry-run
 ```
 
+发布走 GitHub Actions：推 `v*` tag 触发 `.github/workflows/release.yml`，带 npm provenance，
+需要在仓库里配置 `NPM_TOKEN` secret。
+
 宿主半边是 Cordis 插件（`apply(ctx, config)`），客户端半边是
 `window.__ModuleLoader__.load` 注册的 ESM 模块。
 

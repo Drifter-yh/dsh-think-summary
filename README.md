@@ -162,6 +162,9 @@ node --check client.js
 npm pack --dry-run
 ```
 
+Releases are published from CI on tag push (`.github/workflows/release.yml`) with npm
+provenance; it needs an `NPM_TOKEN` repository secret.
+
 The host half is a Cordis plugin (`apply(ctx, config)`); the client half is an ESM
 module registered through `window.__ModuleLoader__.load`.
 
