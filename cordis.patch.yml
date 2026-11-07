@@ -1,0 +1,14 @@
+# @drifter-yh/dsh-think-summary · bundle patch
+#
+# One plugin row: the host half condenses each reasoning step with ctx.llm,
+# the client half renders bullets in the collapsed state.
+- insert:
+    - id: think-summary
+      name: '@drifter-yh/dsh-think-summary'
+      config:
+        provider: opencode-go
+        model: deepseek-v4.1-flash
+        # This route exposes low/high/max only — budget for reasoning tokens.
+        maxOutputTokens: 2000
+        # Longer inputs make the model think longer; head+tail 6000 chars is enough.
+        maxInputChars: 6000
