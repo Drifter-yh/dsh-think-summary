@@ -52,15 +52,20 @@ const DEFAULTS = {
 };
 
 const SYSTEM_PROMPT = [
-  '你是一个编程助手对话的「进度摘要器」。',
+  '你是一个编程助手对话的「进度播报员」。',
   '输入是 AI 助手在一步之内写下的内部思考记录（可能是英文，可能有代码片段）。',
-  '任务：用中文写出 1-3 条要点，让用户 3 秒内知道这一步在想什么、得出了什么结论、打算做什么。',
+  '任务：用中文写 1–2 句自然的进度播报，像同事在旁边说话：先说你完成了什么/看到了什么，再说发现了什么、接下来准备做什么。',
   '要求：',
-  '- 每行一条，以「- 」开头，每条不超过 40 个汉字。',
-  '- 写结论和意图，不要复述工具名，不要贴代码，不要出现「我」「用户说」这类叙述。',
-  '- 如果这段思考只是确认信息、没有新结论，就输出一条「- 核实已知信息」。',
-  '- 只输出要点列表，不要标题、不要解释、不要代码块。',
+  '- 不超过 80 个汉字，最多两句。',
+  '- 说是「进展」，不是「结论清单」：像「我查了事件顺序，卡在记忆抽取，接下来给它加超时」这样连起来说。',
+  '- 不要复述工具名、不要贴代码、不要分点、不要 Markdown、不要标题。',
+  '- 只输出这段播报，不要解释。',
+  '- 示例：我读完了插件的两半代码，确认摘要走的是本地端点，接下来改客户端的额度逻辑。',
+  '- 示例：测试跑通了，但失败回退没覆盖到，我打算补一个跳过预算的场景。',
 ].join('\n');
+
+/** 摘要语义版本：改了提示词/输出格式就加一，避免命中旧格式的缓存。 */
+const PROMPT_VERSION = 'progress-v2';
 
 /** 把一段文本压到上限以内：留头留尾，中间省略。 */
 function clampText(text, max) {
@@ -70,20 +75,30 @@ function clampText(text, max) {
   return `${text.slice(0, head)}\n…（中间省略 ${text.length - max} 字）…\n${text.slice(-tail)}`;
 }
 
-/** 从模型输出里取出要点行；容忍模型加了标题或编号。 */
-function parseBullets(output) {
-  const bullets = [];
-  for (const raw of String(output).split(/\r?\n/u)) {
-    const line = raw.trim();
-    if (line === '') continue;
-    const match = /^(?:[-*•]|\d+[.、)])\s*(.+)$/u.exec(line);
-    const body = (match ? match[1] : line).replace(/\*\*/gu, '').trim();
-    if (body === '' || body.length > 120) continue;
-    if (/^(要点|摘要|总结|thinking|summary)[:：]?$/iu.test(body)) continue;
-    bullets.push(body.slice(0, 80));
-    if (bullets.length >= 3) break;
-  }
-  return bullets;
+/** 缓存键：把提示词版本混进去，改输出格式后旧缓存自动失效，不会新旧混杂。 */
+function cacheKey(text) {
+  return createHash('sha1').update(PROMPT_VERSION).update('\n').update(text).digest('hex');
+}
+
+/**
+ * 把模型输出整理成「进度句子」：容忍它加了列表符号/标题/代码块。
+ * 返回数组是为了兼容老缓存的要点格式；新输出通常只有一条。
+ */
+function parseProgress(output) {
+  const cleaned = String(output)
+    .replace(/```[a-z]*\n?/giu, '')
+    .replace(/```/gu, '')
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .map((line) => line.replace(/^(?:[-*•]|\d+[.、)])\s*/u, ''))
+    .filter((line) => !/^(要点|摘要|总结|进度|thinking|summary)[:：]?$/iu.test(line));
+  const joined = cleaned.join(' ').replace(/\*\*/gu, '').replace(/\s+/gu, ' ').trim();
+  if (joined === '') return [];
+  // 最多留两句，避免模型写成小作文。
+  const sentences = joined.split(/(?<=[。！？!?])\s*/u).filter((item) => item !== '');
+  const picked = sentences.slice(0, 2).join('').trim();
+  return picked === '' ? [] : [picked.slice(0, 120)];
 }
 
 /**
@@ -188,7 +203,7 @@ export function apply(ctx, config = {}) {
     }
 
     return async function summarize(text, sessionId) {
-      const fingerprint = createHash('sha1').update(text).digest('hex');
+      const fingerprint = cacheKey(text);
       const cached = cache.get(fingerprint);
       if (cached !== undefined) return { bullets: cached, cached: true };
 
@@ -234,8 +249,8 @@ export function apply(ctx, config = {}) {
           }
           const failure = finishError(finish);
           if (failure !== undefined) throw new Error(failure);
-          const bullets = parseBullets(output);
-          if (bullets.length === 0) throw new Error('模型没有产出可用的要点');
+          const bullets = parseProgress(output);
+          if (bullets.length === 0) throw new Error('模型没有产出可用的进度句子');
           cache.set(fingerprint, bullets);
           persist();
           return bullets;
@@ -311,7 +326,7 @@ export function apply(ctx, config = {}) {
         if (used >= cfg.maxCallsPerSession) return { skipped: 'budget' };
         if (totalCalls >= cfg.maxCallsTotal) return { skipped: 'budget-total' };
 
-        const fingerprint = createHash('sha1').update(clampText(text, cfg.maxInputChars)).digest('hex');
+        const fingerprint = cacheKey(clampText(text, cfg.maxInputChars));
         if (!cache.has(fingerprint)) {
           calls.set(sessionId, used + 1);
           totalCalls += 1;

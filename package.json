@@ -1,6 +1,6 @@
 {
   "name": "@drifter-yh/dsh-think-summary",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex-style thinking summaries for DeepSeek Harness: condense each reasoning step into 1-3 bullet points inline, keep the full chain one click away.",
   "author": "DeepSeek Harness community contributors",
   "license": "MIT",

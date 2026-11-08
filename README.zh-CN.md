@@ -7,7 +7,7 @@
 [![dsh](https://img.shields.io/badge/dsh-0.2.2--rc.1-4D6BFE)](https://github.com/deepseek-ai/deepseek-harness)
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 用的插件：把每一步的
-思考原文压成 **1–3 条中文要点**，30 分钟的长任务也能一眼扫完；想看原文，点开还是完整思维链。
+思考原文压成 **1–2 句中文进度**，30 分钟的长任务也能一眼扫完；想看原文，点开还是完整思维链。
 
 > 社区插件，非 DeepSeek 官方产品，不受官方维护。
 
@@ -33,13 +33,14 @@ DeepSeek 没有这个通道，想得到同样的体验，只能本地再生成�
 装之后：
 
 ```text
-› 思考 · 摘要
-  • 根因：后端在推送 final 事件前先做记忆抽取，把客户端卡住，只能回退展示原始证据
-  • 计划：先推 final 再封存、给记忆抽取加 12 秒超时、修续跑逻辑跳过孤立用户消息
-  • 还差事件顺序与超时行为的测试
+› 思考 · 进度
+  我读完了插件的两半代码，确认摘要走的是本地端点；接下来改客户端的额度逻辑。
 ```
 
 点这一行展开，仍然是原来的完整思考，Markdown 渲染不变。
+
+想让进度像 Codex 那样「过一个点冒一句」、不用每次点开过程行：在 profile 的 `cordis.patch.yml`
+里给 `ui-chat` 设 `collapseTiming: next-input`，最新一轮跑完会保持展开，直到你发下一条。
 
 ## 安装
 
@@ -88,8 +89,8 @@ dsh plugin --profile <你的 profile> add @drifter-yh/dsh-think-summary
 浏览器                                               宿主进程
 ┌───────────────────────────┐   POST /summarize   ┌──────────────────────────────┐
 │ 遮蔽 assistant-step 渲染器 │ ──────────────────▶ │ ctx.llm.stream()             │
-│ 折叠态 → 要点列表         │ ◀────────────────── │   用配置的 provider/model     │
-│ 展开态 → 原始思考         │     1–3 条要点       │ 内容指纹缓存 + 预算闸门       │
+│ 折叠态 → 一句进度         │ ◀────────────────── │   用配置的 provider/model     │
+│ 展开态 → 原始思考         │     1–2 句进度       │ 内容指纹缓存 + 预算闸门       │
 └───────────────────────────┘                     └──────────────────────────────┘
 ```
 
@@ -107,6 +108,10 @@ dsh plugin --profile <你的 profile> add @drifter-yh/dsh-think-summary
 所以上面那些预算上限是刻意留的。
 
 超过 3 小时的步骤不做回填，打开旧会话不会触发一批调用。
+
+客户端另有一层滑动窗口限速：**每 10 分钟最多 60 次请求**。到顶后行内显示「摘要已暂停」，
+窗口滑过去自动恢复，不会像旧版那样「一页 240 次，用光就永远停摆」。宿主明确返回
+`skipped`（预算用尽/关闭）时，同样的内容 10 分钟内不再重试，滚动来回挂载也不会空打端点。
 
 ## 隐私与安全
 
@@ -136,6 +141,7 @@ dsh plugin --profile <你的 profile> add @drifter-yh/dsh-think-summary
 | 现象 | 检查 |
 | --- | --- |
 | 完全没有要点 | 插件启用了吗？`curl http://127.0.0.1:<端口>/dsh-think-summary/status` |
+| 行内显示「摘要已暂停」 | 悬停看原因：限速等窗口滑过；`budget` 调大宿主预算 |
 | 返回 `skipped: budget` | 调大 `maxCallsPerSession` / `maxCallsTotal` |
 | 宿主日志出现「摘要输出超长」 | 调大 `maxOutputTokens` 或调小 `maxInputChars` |
 | 升级 Harness 后失效 | 提 issue，附上 Harness 版本与控制台报错 |

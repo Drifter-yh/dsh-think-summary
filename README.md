@@ -7,7 +7,7 @@
 [![dsh](https://img.shields.io/badge/dsh-0.2.2--rc.1-4D6BFE)](https://github.com/deepseek-ai/deepseek-harness)
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that turns each
-reasoning step into **1–3 readable bullet points**, so a 30-minute long-horizon run stays
+reasoning step into **one or two plain sentences**, so a 30-minute long-horizon run stays
 skimmable. The full chain of thought is still one click away.
 
 > Community plugin. Not affiliated with or maintained by DeepSeek AI.
@@ -37,15 +37,15 @@ Before:
 After:
 
 ```text
-› 思考 · 摘要
-  • Root cause: the backend blocks the final event on memory extraction, so the client
-    falls back to raw evidence
-  • Plan: emit the final event before sealing, add a 12s timeout, fix the continuation
-    helper to skip orphan user messages
-  • Still needs tests for event ordering and timeout behaviour
+› 思考 · 进度
+  我读完了插件的两半代码，确认摘要走的是本地端点；接下来改客户端的额度逻辑。
 ```
 
 Click the row to read the original reasoning, rendered as Markdown exactly as before.
+
+To get the Codex-like flow — a line of progress as each step settles, with no expanding —
+set `collapseTiming: next-input` for `ui-chat` in your profile's `cordis.patch.yml`. The
+latest turn then stays open until your next message.
 
 ## Install
 
@@ -95,8 +95,8 @@ browser disables requests for that page without touching the profile.
 browser                                              host process
 ┌───────────────────────────┐   POST /summarize   ┌──────────────────────────────┐
 │ shadows assistant-step    │ ──────────────────▶ │ ctx.llm.stream()             │
-│ collapsed → bullets       │ ◀────────────────── │   provider/model from config │
-│ expanded  → raw reasoning │     1–3 bullets     │ content-hash cache + budget  │
+│ collapsed → progress line │ ◀────────────────── │   provider/model from config │
+│ expanded  → raw reasoning │     1–2 sentences   │ content-hash cache + budget  │
 └───────────────────────────┘                     └──────────────────────────────┘
 ```
 
@@ -118,6 +118,13 @@ budgets above exist on purpose.
 
 Rows older than three hours are not backfilled; opening an old session does not trigger
 a wave of calls.
+
+The client also rate-limits itself with a **sliding window of 60 requests per 10 minutes**.
+When the window is full the row shows `摘要已暂停` (summary paused) and recovers
+automatically once it slides — replacing the old lifetime cap of 240 requests per page,
+which a long-lived desktop window could exhaust permanently. Host-side `skipped` answers
+(budget exhausted / disabled) suppress that text for ten minutes, so scrolling a row in and
+out no longer re-hits the endpoint.
 
 ## Privacy and security
 
@@ -150,6 +157,7 @@ a wave of calls.
 | Symptom | Check |
 | --- | --- |
 | No bullets anywhere | Is the plugin enabled? `curl http://127.0.0.1:<port>/dsh-think-summary/status` |
+| Row shows `摘要已暂停` | Hover for the reason: rate window (wait for it to slide) or budget (raise the host ceilings) |
 | `skipped: budget` | Raise `maxCallsPerSession` / `maxCallsTotal` |
 | `摘要输出超长` in the host log | Raise `maxOutputTokens` or lower `maxInputChars` |
 | Summaries stop after a Harness update | Open an issue with the Harness version and the console error |

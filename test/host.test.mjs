@@ -1,23 +1,26 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { apply } from '../index.js';
 
 /** Build an app with a fake llm + webServer and return the route handler. */
-function createApp({ config = {}, llm } = {}) {
+function createApp({ config = {}, llm, seedCache } = {}) {
   const routes = [];
   const calls = { llm: 0 };
   const fakeLlm = llm ?? {
     async *stream() {
       calls.llm += 1;
-      yield { type: 'text-delta', text: '- First point\n- Second point\n- Third point\n' };
+      yield { type: 'text-delta', text: '- 我读完了代码。\n- 接下来改额度逻辑。\n' };
       yield { type: 'finish', reason: { kind: 'stop' } };
     },
   };
   const dir = mkdtempSync(join(tmpdir(), 'think-summary-'));
+  const cachePath = join(dir, 'cache.json');
+  if (seedCache !== undefined) writeFileSync(cachePath, JSON.stringify(seedCache), 'utf8');
   const ctx = {
     llm: fakeLlm,
     get: (name) => (name === 'llm' ? fakeLlm : undefined),
@@ -35,7 +38,7 @@ function createApp({ config = {}, llm } = {}) {
     },
   };
   apply(ctx, {
-    cacheFile: join(dir, 'cache.json'),
+    cacheFile: cachePath,
     minChars: 10,
     ...config,
   });
@@ -72,12 +75,42 @@ async function request(handler, { method = 'POST', path = '/dsh-think-summary/su
   return { status, json: text === '' ? null : JSON.parse(text) };
 }
 
-test('summarises a step and strips list markers', async () => {
+test('summarises a step into one progress line and strips list markers', async () => {
   const app = createApp();
   try {
     const { status, json } = await request(app.handler, { body: { sessionId: 's1', text: 'x'.repeat(200) } });
     assert.equal(status, 200);
-    assert.deepEqual(json.bullets, ['First point', 'Second point', 'Third point']);
+    assert.deepEqual(json.bullets, ['我读完了代码。接下来改额度逻辑。']);
+    assert.equal(json.cached, false);
+    assert.equal(app.calls.llm, 1);
+  } finally {
+    app.cleanup();
+  }
+});
+
+test('a long model answer is trimmed to two sentences and code fences are dropped', async () => {
+  const app = createApp({
+    llm: {
+      async *stream() {
+        yield { type: 'text-delta', text: '```text\n一。\n二。\n三。\n```\n' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+  });
+  try {
+    const { json } = await request(app.handler, { body: { sessionId: 's1', text: 'k'.repeat(200) } });
+    assert.deepEqual(json.bullets, ['一。二。']);
+  } finally {
+    app.cleanup();
+  }
+});
+
+test('old bullet-format cache entries are ignored after the prompt version bump', async () => {
+  const text = 'q'.repeat(200);
+  const legacyKey = createHash('sha1').update(text).digest('hex');
+  const app = createApp({ seedCache: { [legacyKey]: ['旧格式要点'] } });
+  try {
+    const { json } = await request(app.handler, { body: { sessionId: 's1', text } });
     assert.equal(json.cached, false);
     assert.equal(app.calls.llm, 1);
   } finally {

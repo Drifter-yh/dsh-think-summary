@@ -40,10 +40,26 @@ window.__ModuleLoader__.load({
     })();
     /** 只给「最近」的步骤做摘要：打开历史会话时不做全量回填，免得白花钱。 */
     const RECENT_MS = 3 * 60 * 60 * 1000;
-    /** 单页生命周期内最多发起多少次摘要请求。 */
-    const MAX_REQUESTS = 240;
+    /**
+     * 滑动窗口限速：窗口内最多 RATE_LIMIT 次请求。
+     * 不用「单页生命周期总数」是因为桌面窗口常开一整天，总数上限会用光且再也恢复不了；
+     * 窗口滑过去就自动恢复，既不会饿死，也不会无限打。
+     */
+    const RATE_WINDOW_MS = 10 * 60 * 1000;
+    const RATE_LIMIT = 60;
+    /** 被限速挡下后，隔多久自动再试一次。 */
+    const RATE_RETRY_MS = 60 * 1000;
+    /** 宿主明确说「这段不做」（预算用尽/关闭）后，同样内容在这段时间内不再重试。 */
+    const SUPPRESS_TTL = 10 * 60 * 1000;
     /** 同时在飞的请求上限。 */
     const MAX_PARALLEL = 3;
+    /** 「摘要已暂停」的悬浮说明。 */
+    const PAUSED_HINTS = {
+      'rate-limited': '请求太频繁，等窗口滑过去会自动恢复',
+      budget: '本会话的摘要次数已达上限',
+      'budget-total': '进程级摘要次数已达上限',
+      disabled: '摘要在宿主配置里已关闭',
+    };
 
     /* ------------------------------------------------------------------ *
      * 文本工具（与出厂 reasoning-text.js 同构）
@@ -125,23 +141,30 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ *
-     * 摘要获取（本地缓存 + 并发去重）
+     * 摘要获取（本地缓存 + 并发去重 + 滑动窗口限速）
      * ------------------------------------------------------------------ */
-    const SUMMARY_CACHE = new Map();   // fingerprint -> bullets[]
-    const SUMMARY_PENDING = new Map(); // fingerprint -> Promise
-    let issued = 0;
+    const SUMMARY_CACHE = new Map();      // fingerprint -> bullets[]
+    const SUMMARY_PENDING = new Map();    // fingerprint -> { refs, controller, promise }
+    const SUMMARY_FAILED = new Map();     // fingerprint -> timestamp（真失败，短期内不重试）
+    const SUMMARY_SUPPRESSED = new Map(); // fingerprint -> timestamp（宿主明确说「不做」）
+    const requestTimes = [];              // 滑动窗口内的请求时间戳
+    const FAILURE_TTL = 10 * 60 * 1000;
     let active = 0;
     const waiters = [];
-    /** 失败过的指纹：10 分钟内不再重试，避免虚拟滚动反复挂载时反复打宿主。 */
-    const SUMMARY_FAILED = new Map(); // fingerprint -> timestamp
-    const FAILURE_TTL = 10 * 60 * 1000;
     let consecutiveFailures = 0;
     let circuitOpenUntil = 0;
 
+    /** 滑动窗口限速：窗口内到顶就本次不发起（不排队、不计失败，窗口滑过自动恢复）。 */
+    function takeRateSlot() {
+      const now = Date.now();
+      while (requestTimes.length > 0 && now - requestTimes[0] >= RATE_WINDOW_MS) requestTimes.shift();
+      if (requestTimes.length >= RATE_LIMIT) return false;
+      requestTimes.push(now);
+      return true;
+    }
+
     /** 简单并发闸门：超出并发上限的请求排队，不并发打爆宿主。 */
     function schedule(task) {
-      if (issued >= MAX_REQUESTS) return Promise.reject(new Error('quota'));
-      issued += 1;
       return new Promise((resolve, reject) => {
         const run = () => {
           active += 1;
@@ -156,46 +179,106 @@ window.__ModuleLoader__.load({
       });
     }
 
-    function summarize(text, sessionId) {
+    function abortError() {
+      try { return new DOMException('aborted', 'AbortError'); } catch { /* 老环境没有 DOMException */ }
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      return error;
+    }
+
+    /**
+     * 关注者离开时递减引用；最后一个关注者离开才真正取消在途请求。
+     * 同一个指纹可能被多行/多次挂载共享，单独一行卸载不该掐断别人的请求。
+     */
+    function watchAbort(entry, signal) {
+      if (signal === undefined || signal === null || typeof signal.addEventListener !== 'function') return () => {};
+      const onAbort = () => {
+        entry.refs -= 1;
+        if (entry.refs <= 0 && !entry.controller.signal.aborted) entry.controller.abort();
+      };
+      if (signal.aborted) { onAbort(); return () => {}; }
+      signal.addEventListener('abort', onAbort, { once: true });
+      return () => { signal.removeEventListener('abort', onAbort); };
+    }
+
+    /** 建一次在途请求；同一个指纹的所有调用方共享它。 */
+    function createEntry(key, text, sessionId) {
+      const controller = new AbortController();
+      const entry = { refs: 0, controller, promise: null };
+      const url = new URL(`${ROUTE}/summarize`, document.baseURI).href;
+      entry.promise = schedule(() => {
+        if (controller.signal.aborted) return Promise.reject(abortError());
+        return fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text, sessionId }),
+          signal: controller.signal,
+        })
+          .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+          .then((payload) => {
+            const bullets = Array.isArray(payload && payload.bullets) ? payload.bullets : null;
+            if (bullets === null || bullets.length === 0) {
+              const reason = payload && typeof payload.skipped === 'string' ? payload.skipped : 'empty';
+              if (reason === 'empty') throw new Error('模型没有产出可用的要点');
+              // 宿主已经明确「这段不做」：记下来，别让重新挂载反复打。
+              SUMMARY_SUPPRESSED.set(key, Date.now());
+              return { bullets: null, skipped: reason };
+            }
+            SUMMARY_CACHE.set(key, bullets);
+            return { bullets, cached: false };
+          })
+          .then((result) => {
+            consecutiveFailures = 0;
+            return result;
+          }, (error) => {
+            const message = error && typeof error.message === 'string' ? error.message : '';
+            // 取消、限速、已抑制、已缓存失败、熔断：都不算真失败，不该把它们计进熔断。
+            const ignored = (error && error.name === 'AbortError')
+              || message === 'suppressed'
+              || message === 'rate-limited'
+              || message === 'cached-failure'
+              || message === 'circuit-open';
+            if (!ignored) {
+              SUMMARY_FAILED.set(key, Date.now());
+              consecutiveFailures += 1;
+              if (consecutiveFailures >= 5) circuitOpenUntil = Date.now() + 60 * 1000;
+            }
+            throw error;
+          })
+          .finally(() => { SUMMARY_PENDING.delete(key); });
+      });
+      return entry;
+    }
+
+    function summarize(text, sessionId, signal) {
       const key = fingerprint(text);
       const cached = SUMMARY_CACHE.get(key);
       if (cached !== undefined) return Promise.resolve({ bullets: cached, cached: true });
-
-      const pending = SUMMARY_PENDING.get(key);
-      if (pending !== undefined) return pending;
 
       const failedAt = SUMMARY_FAILED.get(key);
       if (failedAt !== undefined && Date.now() - failedAt < FAILURE_TTL) {
         return Promise.reject(new Error('cached-failure'));
       }
+
+      const suppressedAt = SUMMARY_SUPPRESSED.get(key);
+      if (suppressedAt !== undefined && Date.now() - suppressedAt < SUPPRESS_TTL) {
+        return Promise.reject(new Error('suppressed'));
+      }
+
       if (Date.now() < circuitOpenUntil) return Promise.reject(new Error('circuit-open'));
 
-      const url = new URL(`${ROUTE}/summarize`, document.baseURI).href;
-      const task = schedule(() => fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text, sessionId }),
-      })
-        .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
-        .then((payload) => {
-          const bullets = Array.isArray(payload && payload.bullets) ? payload.bullets : null;
-          if (bullets === null || bullets.length === 0) return { bullets: null, skipped: payload && payload.skipped };
-          SUMMARY_CACHE.set(key, bullets);
-          return { bullets, cached: false };
-        })
-        .then((result) => {
-          consecutiveFailures = 0;
-          return result;
-        }, (error) => {
-          SUMMARY_FAILED.set(key, Date.now());
-          consecutiveFailures += 1;
-          if (consecutiveFailures >= 5) circuitOpenUntil = Date.now() + 60 * 1000;
-          throw error;
-        })
-        .finally(() => { SUMMARY_PENDING.delete(key); }));
-
-      SUMMARY_PENDING.set(key, task);
-      return task;
+      let entry = SUMMARY_PENDING.get(key);
+      if (entry === undefined) {
+        if (!takeRateSlot()) return Promise.reject(new Error('rate-limited'));
+        entry = createEntry(key, text, sessionId);
+        SUMMARY_PENDING.set(key, entry);
+      }
+      entry.refs += 1;
+      const detach = watchAbort(entry, signal);
+      return entry.promise.then(
+        (value) => { detach(); return value; },
+        (error) => { detach(); throw error; },
+      );
     }
 
     /* ------------------------------------------------------------------ *
@@ -213,10 +296,8 @@ window.__ModuleLoader__.load({
 .ts-meta{flex:0 0 auto;font-size:12px;opacity:.7}
 .ts-body{padding:2px 6px 6px 26px;font-size:13px;line-height:21px;
   color:var(--dsw-alias-label-primary,#d6d6d6)}
-.ts-bullets{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:3px}
-.ts-bullets li{position:relative;padding-left:12px}
-.ts-bullets li::before{content:'';position:absolute;left:2px;top:9px;width:4px;height:4px;border-radius:50%;
-  background:currentColor;opacity:.45}
+.ts-lines{display:flex;flex-direction:column;gap:2px}
+.ts-line{display:block}
 .ts-preview{opacity:.72;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ts-pending{opacity:.6;font-style:italic}
 .ts-error{opacity:.5;font-size:12px}
@@ -251,6 +332,8 @@ window.__ModuleLoader__.load({
       const { text, running, sessionId, startedAt, t } = props;
       const [expanded, setExpanded] = React.useState(false);
       const [state, setState] = React.useState({ status: 'idle', bullets: null });
+      /** 被限速而暂停时，隔一阵自动重试；否则「暂停」会一直挂到重新挂载为止。 */
+      const [attempt, setAttempt] = React.useState(0);
 
       React.useEffect(() => {
         if (LOCAL_DISABLED) return undefined;
@@ -258,17 +341,35 @@ window.__ModuleLoader__.load({
         if (text.trim().length < MIN_CHARS) return undefined;
         if (typeof startedAt === 'number' && startedAt > 0 && Date.now() - startedAt > RECENT_MS) return undefined;
         let alive = true;
-        setState((current) => (current.status === 'ok' ? current : { status: 'loading', bullets: null }));
-        summarize(text, sessionId).then(
+        let retry = null;
+        const controller = new AbortController();
+        setState((current) => (current.status === 'ok' || current.status === 'paused'
+          ? current
+          : { status: 'loading', bullets: null }));
+        summarize(text, sessionId, controller.signal).then(
           (result) => {
             if (!alive) return;
-            if (result.bullets === null) setState({ status: 'empty', bullets: null });
+            if (result.bullets === null) setState({ status: 'paused', bullets: null, reason: result.skipped });
             else setState({ status: 'ok', bullets: result.bullets });
           },
-          () => { if (alive) setState({ status: 'error', bullets: null }); },
+          (error) => {
+            if (!alive) return;
+            const message = error && typeof error.message === 'string' ? error.message : '';
+            // 限速是「暂时不做」，不是「做失败」：行内标为暂停，等下自动再试。
+            if (message === 'rate-limited') {
+              setState({ status: 'paused', bullets: null, reason: message });
+              retry = setTimeout(() => { if (alive) setAttempt((value) => value + 1); }, RATE_RETRY_MS);
+            } else {
+              setState({ status: 'error', bullets: null });
+            }
+          },
         );
-        return () => { alive = false; };
-      }, [text, running, sessionId, startedAt]);
+        return () => {
+          alive = false;
+          controller.abort();
+          if (retry !== null) clearTimeout(retry);
+        };
+      }, [text, running, sessionId, startedAt, attempt]);
 
       const preview = React.useMemo(
         () => (running ? latestCompletedParagraphFirstLine(text) : firstLine(text)).replaceAll('**', ''),
@@ -277,14 +378,23 @@ window.__ModuleLoader__.load({
 
       const toggle = React.useCallback(() => setExpanded((value) => !value), []);
 
-      const meta = running ? '进行中' : state.status === 'ok' ? '摘要' : state.status === 'loading' ? '整理中' : '';
+      const meta = running ? '进行中'
+        : state.status === 'ok' ? '进度'
+        : state.status === 'loading' ? '整理中'
+        : state.status === 'paused' ? '摘要已暂停'
+        : '';
+
+      // 暂停时把原因挂在标题上，别让人对着「怎么没要点」猜。
+      const hint = state.status === 'paused'
+        ? (PAUSED_HINTS[state.reason] ?? '摘要暂时不可用，稍后自动恢复')
+        : '';
 
       const body = expanded
         ? h('div', { className: 'ts-raw' }, h(RawReasoning, { text, running, t }))
         : state.status === 'ok'
-          ? h('ul', { className: 'ts-bullets' }, state.bullets.map((bullet, index) => h('li', { key: index }, bullet)))
+          ? h('div', { className: 'ts-lines' }, state.bullets.map((line, index) => h('div', { key: index, className: 'ts-line' }, line)))
           : state.status === 'loading'
-            ? h('div', { className: 'ts-pending' }, preview === '' ? '正在整理这一步的要点…' : preview)
+            ? h('div', { className: 'ts-pending' }, preview === '' ? '正在整理这一步的进度…' : preview)
             : h('div', { className: 'ts-preview' }, preview);
 
       return h('div', { className: 'ts-root', 'data-think-summary': '' },
@@ -292,6 +402,7 @@ window.__ModuleLoader__.load({
           type: 'button',
           className: 'ts-head',
           'aria-expanded': expanded,
+          title: hint === '' ? undefined : hint,
           onClick: toggle,
         },
         h('span', { className: 'ts-chevron', 'aria-hidden': true }, expanded ? '▾' : '▸'),
